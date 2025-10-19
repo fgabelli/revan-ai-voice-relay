@@ -1,17 +1,8 @@
 /**
  * Voice AI Relay for Twilio Programmable Voice + OpenAI Realtime + n8n
- * ------------------------------------------------------------
- * - /voice: risponde con TwiML che apre uno Stream WS su /twilio-media (forzato wss://)
- * - WebSocket: ponte audio Twilio <-> OpenAI Realtime (G.711 u-law 8kHz)
+ * - /voice: TwiML che apre uno Stream WS su /twilio-media (forzato wss://)
+ * - WS bridge: audio Twilio <-> OpenAI Realtime (G.711 u-law 8kHz)
  * - A fine chiamata invia transcript + campi a n8n (N8N_SUMMARY_WEBHOOK)
- *
- * Requisiti:
- *   Node 18+  |  npm i express twilio body-parser ws node-fetch dotenv
- *
- * Variabili (Render → Environment):
- *   OPENAI_API_KEY=sk-...
- *   N8N_SUMMARY_WEBHOOK=https://<tuo-n8n>/webhook/ai-receptionist/summary
- *   SYSTEM_PROMPT=... (opzionale: prompt personalità centralinista)
  */
 
 import 'dotenv/config';
@@ -21,7 +12,7 @@ import fetch from 'node-fetch';
 import { WebSocketServer, WebSocket } from 'ws';
 
 const app = express();
-app.set('trust proxy', 1); // dietro proxy (Render/Heroku)
+app.set('trust proxy', 1);
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
@@ -41,10 +32,9 @@ ISTRUZIONI:
 5) Mantieni risposte brevi (max 2 frasi).
 6) Chiudi: “Grazie, la faremo richiamare al più presto. Buona giornata!”.`;
 
-/** In-memory session: callSid -> { transcript: [], fields: {}, start } */
 const sessions = new Map();
 
-/** 1) TwiML: forza wss:// per Media Streams */
+/* 1) TwiML: forza wss:// per Media Streams */
 app.post('/voice', (req, res) => {
   const callSid = req.body?.CallSid || `call_${Date.now()}`;
   const host = req.get('host');
@@ -60,22 +50,24 @@ app.post('/voice', (req, res) => {
   res.set('Content-Type', 'text/xml').send(twiml);
 });
 
-/** 2) WS server per Twilio Media Streams */
+/* 2) WS server per Twilio Media Streams */
 const wss = new WebSocketServer({ noServer: true });
 
 async function openAIRealtimeSocket(systemPrompt) {
-  // Verifica di avere accesso al modello realtime nel tuo account
   const url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview';
   const headers = {
     Authorization: `Bearer ${OPENAI_API_KEY}`,
     'OpenAI-Beta': 'realtime=v1',
   };
   const socket = new WebSocket(url, { headers });
+
   await new Promise((resolve, reject) => {
     socket.on('open', resolve);
     socket.on('error', reject);
   });
-  const init = {
+
+  // Config sessione
+  socket.send(JSON.stringify({
     type: 'session.update',
     session: {
       instructions: systemPrompt,
@@ -83,8 +75,16 @@ async function openAIRealtimeSocket(systemPrompt) {
       input_audio_format: { type: 'g711_ulaw', sample_rate_hz: 8000 },
       output_audio_format: { type: 'g711_ulaw', sample_rate_hz: 8000 },
     },
-  };
-  socket.send(JSON.stringify(init));
+  }));
+
+  // 👉 Avvio: fai parlare l’AI subito con un saluto
+  socket.send(JSON.stringify({
+    type: 'response.create',
+    response: {
+      instructions: 'Inizia la conversazione con il saluto di benvenuto e chiedi come puoi aiutare.',
+    },
+  }));
+
   return socket;
 }
 
@@ -110,27 +110,26 @@ async function finalizeAndNotify(callSid) {
   }
 }
 
-/** Gestione nuova connessione WS da Twilio */
+/* Connessione WS da Twilio */
 wss.on('connection', async (twilioWS, request) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
   const callSid = url.searchParams.get('callSid') || `call_${Date.now()}`;
   const session = sessions.get(callSid) || { transcript: [], fields: {}, start: Date.now() };
   sessions.set(callSid, session);
 
-  // Connessione a OpenAI Realtime
   let aiWS;
   try {
     aiWS = await openAIRealtimeSocket(SYSTEM_PROMPT);
+    console.log('[OpenAI] realtime socket connected');
   } catch (e) {
-    console.error('OpenAI WS error:', e);
+    console.error('[OpenAI] WS error at connect:', e);
     try { twilioWS.close(); } catch {}
     return;
   }
 
-  // === Stato del media stream Twilio ===
   let streamSid = null;
 
-  // Messaggi da OpenAI → verso Twilio (includi SEMPRE streamSid)
+  // Messaggi da OpenAI → verso Twilio (ricorda lo streamSid)
   aiWS.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
@@ -139,8 +138,8 @@ wss.on('connection', async (twilioWS, request) => {
         if (streamSid) {
           twilioWS.send(JSON.stringify({
             event: 'media',
-            streamSid,                  // OBBLIGATORIO per far riprodurre audio a Twilio
-            media: { payload: msg.audio } // base64 G.711 u-law
+            streamSid,
+            media: { payload: msg.audio }, // base64 μ-law
           }));
         } else {
           console.warn('[Twilio] missing streamSid, skipping outbound audio');
@@ -150,13 +149,10 @@ wss.on('connection', async (twilioWS, request) => {
       if (msg.type === 'transcript.delta' && msg.text) {
         session.transcript.push({ from: msg.from || 'agent', text: msg.text, t: Date.now() });
       }
-
       if (msg.type === 'extracted.fields' && msg.fields) {
         Object.assign(session.fields, msg.fields);
       }
-    } catch (_e) {
-      // ignora pacchetti non JSON
-    }
+    } catch (_) {}
   });
 
   // Messaggi da Twilio → verso OpenAI
@@ -173,7 +169,7 @@ wss.on('connection', async (twilioWS, request) => {
       if (msg.event === 'media' && msg.media?.payload) {
         aiWS.send(JSON.stringify({
           type: 'input_audio_buffer.append',
-          audio: msg.media.payload // base64 u-law
+          audio: msg.media.payload,
         }));
         return;
       }
@@ -201,7 +197,7 @@ wss.on('connection', async (twilioWS, request) => {
   });
 });
 
-// Upgrade HTTP → WS
+/* Upgrade HTTP → WS */
 const server = app.listen(PORT, () => {
   console.log(`Voice relay listening on :${PORT}`);
 });
@@ -214,5 +210,5 @@ server.on('upgrade', (request, socket, head) => {
   }
 });
 
-// Healthcheck
+/* Healthcheck */
 app.get('/', (_req, res) => res.send('OK'));
