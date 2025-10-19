@@ -3,6 +3,7 @@
  * - /voice: TwiML che apre uno Stream WS su /twilio-media (wss://)
  * - WS bridge: audio Twilio <-> OpenAI Realtime (G.711 μ-law 8kHz)
  * - A fine chiamata invia transcript + campi a n8n (N8N_SUMMARY_WEBHOOK)
+ * - ECHO_DEBUG: se =1 attiva loopback (rimanda al chiamante ciò che riceve da Twilio)
  */
 
 import 'dotenv/config';
@@ -19,6 +20,8 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const N8N_SUMMARY_WEBHOOK = process.env.N8N_SUMMARY_WEBHOOK;
+const ECHO_DEBUG = process.env.ECHO_DEBUG === '1';
+
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   `Sei una centralinista virtuale di Revan SAS, azienda di consulenza IT e digitale.
@@ -111,6 +114,15 @@ wss.on('connection', async (twilioWS, request) => {
   let aiWS = null;
   let aiReady = false;
 
+  // Counters per debug
+  let framesFromCaller = 0;
+  let framesEchoed = 0;
+  let framesFromAI = 0;
+  let framesToTwilio = 0;
+  const dump = setInterval(() => {
+    console.log(`[STAT] in=${framesFromCaller} echo=${framesEchoed} ai=${framesFromAI} out=${framesToTwilio}`);
+  }, 3000);
+
   // 1) Ricevo eventi Twilio e catturo streamSid
   twilioWS.on('message', (raw) => {
     try {
@@ -118,22 +130,34 @@ wss.on('connection', async (twilioWS, request) => {
 
       if (msg.event === 'start') {
         streamSid = msg.start?.streamSid || msg.streamSid || null;
-        console.log('[Twilio] START', { callSid, streamSid });
+        console.log('[Twilio] START', { callSid, streamSid, echo: ECHO_DEBUG });
         return;
       }
 
       if (msg.event === 'media' && msg.media?.payload) {
+        framesFromCaller++;
+        // Inoltro all'AI
         if (aiReady && aiWS) {
           aiWS.send(JSON.stringify({
             type: 'input_audio_buffer.append',
             audio: msg.media.payload, // base64 G.711 μ-law
           }));
         }
+        // ECHO di test: rimando al chiamante quello che ricevo da Twilio
+        if (ECHO_DEBUG && streamSid) {
+          twilioWS.send(JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: msg.media.payload },
+          }));
+          framesEchoed++;
+        }
         return;
       }
 
       if (msg.event === 'stop') {
         console.log('[Twilio] STOP', callSid);
+        clearInterval(dump);
         if (aiWS) {
           try { aiWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); } catch {}
           try { aiWS.send(JSON.stringify({ type: 'response.create', response: { instructions: 'fine chiamata' } })); } catch {}
@@ -153,7 +177,7 @@ wss.on('connection', async (twilioWS, request) => {
     aiReady = true;
     console.log('[OpenAI] realtime socket connected');
 
-    // Saluto iniziale (così sai subito se l'audio esce)
+    // Saluto iniziale (così sappiamo se esce audio dall'AI)
     aiWS.send(JSON.stringify({
       type: 'response.create',
       response: { instructions: 'Saluta in italiano e chiedi come puoi aiutare.' },
@@ -171,12 +195,14 @@ wss.on('connection', async (twilioWS, request) => {
         const audioPayload = msg.audio || msg.delta;
 
         if (isAudioDelta && audioPayload) {
+          framesFromAI++;
           if (streamSid) {
             twilioWS.send(JSON.stringify({
               event: 'media',
-              streamSid,                 // <<< fondamentale
+              streamSid,                 // fondamentale
               media: { payload: audioPayload }, // base64 μ-law
             }));
+            framesToTwilio++;
           } else {
             console.warn('[Twilio] missing streamSid; audio skipped');
           }
@@ -192,6 +218,7 @@ wss.on('connection', async (twilioWS, request) => {
     });
 
     aiWS.on('close', () => {
+      clearInterval(dump);
       try { twilioWS.close(); } catch {}
     });
 
@@ -203,6 +230,7 @@ wss.on('connection', async (twilioWS, request) => {
 
   // 4) Pulizia e invio riepilogo
   twilioWS.on('close', () => {
+    clearInterval(dump);
     finalizeAndNotify(callSid);
     try { aiWS?.close(); } catch {}
   });
