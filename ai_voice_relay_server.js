@@ -3,7 +3,7 @@
  * - /voice: TwiML che apre uno Stream WS su /twilio-media (wss://)
  * - WS bridge: audio Twilio <-> OpenAI Realtime (G.711 μ-law 8kHz)
  * - A fine chiamata invia transcript + campi a n8n (N8N_SUMMARY_WEBHOOK)
- * - ECHO_DEBUG: se =1 attiva loopback (rimanda al chiamante ciò che riceve da Twilio)
+ * - [FIX] Imposta voce TTS 'alloy' per far emettere audio al Realtime
  */
 
 import 'dotenv/config';
@@ -53,7 +53,7 @@ app.post('/voice', (req, res) => {
   res.set('Content-Type', 'text/xml').send(twiml);
 });
 
-/* Connessione a OpenAI Realtime */
+/* Connessione a OpenAI Realtime (con voce impostata) */
 function connectOpenAI(systemPrompt) {
   return new Promise((resolve, reject) => {
     const url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview';
@@ -63,12 +63,14 @@ function connectOpenAI(systemPrompt) {
     };
     const socket = new WebSocket(url, { headers });
     socket.once('open', () => {
+      // Imposta VOICE = 'alloy' + formati audio
       socket.send(JSON.stringify({
         type: 'session.update',
         session: {
           instructions: systemPrompt,
           modalities: ['audio', 'text'],
-          input_audio_format: { type: 'g711_ulaw', sample_rate_hz: 8000 },
+          voice: 'alloy', // <<< voce TTS necessaria per far uscire audio
+          input_audio_format:  { type: 'g711_ulaw', sample_rate_hz: 8000 },
           output_audio_format: { type: 'g711_ulaw', sample_rate_hz: 8000 },
         },
       }));
@@ -114,13 +116,12 @@ wss.on('connection', async (twilioWS, request) => {
   let aiWS = null;
   let aiReady = false;
 
-  // Counters per debug
+  // Counters debug
   let framesFromCaller = 0;
-  let framesEchoed = 0;
   let framesFromAI = 0;
   let framesToTwilio = 0;
   const dump = setInterval(() => {
-    console.log(`[STAT] in=${framesFromCaller} echo=${framesEchoed} ai=${framesFromAI} out=${framesToTwilio}`);
+    console.log(`[STAT] in=${framesFromCaller} ai=${framesFromAI} out=${framesToTwilio}`);
   }, 3000);
 
   // 1) Ricevo eventi Twilio e catturo streamSid
@@ -136,22 +137,13 @@ wss.on('connection', async (twilioWS, request) => {
 
       if (msg.event === 'media' && msg.media?.payload) {
         framesFromCaller++;
-        // Inoltro all'AI
         if (aiReady && aiWS) {
           aiWS.send(JSON.stringify({
             type: 'input_audio_buffer.append',
             audio: msg.media.payload, // base64 G.711 μ-law
           }));
         }
-        // ECHO di test: rimando al chiamante quello che ricevo da Twilio
-        if (ECHO_DEBUG && streamSid) {
-          twilioWS.send(JSON.stringify({
-            event: 'media',
-            streamSid,
-            media: { payload: msg.media.payload },
-          }));
-          framesEchoed++;
-        }
+        // niente echo qui (ECHO_DEBUG è off)
         return;
       }
 
@@ -177,10 +169,14 @@ wss.on('connection', async (twilioWS, request) => {
     aiReady = true;
     console.log('[OpenAI] realtime socket connected');
 
-    // Saluto iniziale (così sappiamo se esce audio dall'AI)
+    // Saluto iniziale con voice 'alloy' e output audio esplicito
     aiWS.send(JSON.stringify({
       type: 'response.create',
-      response: { instructions: 'Saluta in italiano e chiedi come puoi aiutare.' },
+      response: {
+        instructions: 'Saluta in italiano e chiedi come puoi aiutare.',
+        modalities: ['audio'],
+        audio: { voice: 'alloy' } // <<< importante
+      },
     }));
 
     // 3) Dall'AI -> verso Twilio (rimando audio con streamSid)
@@ -199,8 +195,8 @@ wss.on('connection', async (twilioWS, request) => {
           if (streamSid) {
             twilioWS.send(JSON.stringify({
               event: 'media',
-              streamSid,                 // fondamentale
-              media: { payload: audioPayload }, // base64 μ-law
+              streamSid,                       // fondamentale
+              media: { payload: audioPayload } // base64 μ-law
             }));
             framesToTwilio++;
           } else {
