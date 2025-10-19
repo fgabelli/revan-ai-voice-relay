@@ -53,32 +53,88 @@ app.post('/voice', (req, res) => {
   res.set('Content-Type', 'text/xml').send(twiml);
 });
 
-/* Connessione a OpenAI Realtime (con voce impostata) */
-function connectOpenAI(systemPrompt) {
-  return new Promise((resolve, reject) => {
-    const url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview';
-    const headers = {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'OpenAI-Beta': 'realtime=v1',
-    };
-    const socket = new WebSocket(url, { headers });
-    socket.once('open', () => {
-      // Imposta VOICE = 'alloy' + formati audio
-      socket.send(JSON.stringify({
-        type: 'session.update',
-        session: {
-          instructions: systemPrompt,
-          modalities: ['audio', 'text'],
-          voice: 'alloy', // <<< voce TTS necessaria per far uscire audio
-          input_audio_format:  { type: 'g711_ulaw', sample_rate_hz: 8000 },
-          output_audio_format: { type: 'g711_ulaw', sample_rate_hz: 8000 },
-        },
-      }));
-      resolve(socket);
-    });
-    socket.once('error', reject);
+// 2) Connetto OpenAI
+try {
+  aiWS = await connectOpenAI(SYSTEM_PROMPT);
+  aiReady = true;
+  console.log('[OpenAI] realtime socket connected');
+
+  // TEST TTS: forziamo una frase esplicita da pronunciare
+  aiWS.send(JSON.stringify({
+    type: 'response.create',
+    response: {
+      modalities: ['audio'],
+      instructions: 'Pronuncia esattamente: "Pronto, sono la centralinista Revan. Come posso aiutarla?"',
+      audio: { voice: 'alloy' }
+    }
+  }));
+
+  // 3) Dall'AI -> verso Twilio (rimando audio con streamSid) + LOG esteso
+  let debugCount = 0;
+  aiWS.on('message', (data) => {
+    try {
+      const raw = data.toString();
+      let msg;
+      try { msg = JSON.parse(raw); } catch {
+        // non JSON: ignora
+        return;
+      }
+
+      // Log leggero dei primi 20 messaggi per capire i tipi che arrivano
+      if (debugCount < 20) {
+        const keys = Object.keys(msg || {});
+        console.log('[AI EVT]', ++debugCount, msg.type, keys);
+      }
+
+      // Cattura più varianti possibili di audio
+      const isAudioDelta =
+        (msg.type === 'response.audio.delta' && msg.audio) ||
+        (msg.type === 'response.output_audio.delta' && msg.delta) ||
+        (msg.type === 'response.audio.chunk' && msg.chunk) ||
+        (msg.type === 'response.output_audio.chunk' && msg.chunk);
+
+      // Prova a trovare bytes audio anche in strutture annidate (alcune versioni li mettono in output[0].content[0].audio.bytes)
+      const nestedBytes = msg?.output?.[0]?.content?.[0]?.audio?.bytes || msg?.response?.output?.[0]?.content?.[0]?.audio?.bytes;
+
+      const audioPayload = msg.audio || msg.delta || msg.chunk || nestedBytes;
+
+      if (isAudioDelta || audioPayload) {
+        framesFromAI++;
+        const payload = audioPayload;
+        if (payload && streamSid) {
+          twilioWS.send(JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload } // base64 μ-law
+          }));
+          framesToTwilio++;
+        }
+      }
+
+      // Log utile se l'AI risponde solo in testo
+      if ((msg.type === 'response.delta' || msg.type === 'response.text.delta') && msg.delta) {
+        console.log('[AI TEXT]', msg.delta);
+      }
+
+      if (msg.type === 'transcript.delta' && msg.text) {
+        session.transcript.push({ from: msg.from || 'agent', text: msg.text, t: Date.now() });
+      }
+      if (msg.type === 'extracted.fields' && msg.fields) {
+        Object.assign(session.fields, msg.fields);
+      }
+    } catch (_) {}
   });
+
+  aiWS.on('close', () => {
+    try { twilioWS.close(); } catch {}
+  });
+
+} catch (e) {
+  console.error('[OpenAI] WS error at connect:', e);
+  try { twilioWS.close(); } catch {}
+  return;
 }
+
 
 /* Invio riassunto a n8n */
 async function finalizeAndNotify(callSid) {
